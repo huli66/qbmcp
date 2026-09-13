@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -156,6 +157,7 @@ func toolResult(value any, err error) *mcp.CallToolResult {
 }
 
 type Health struct {
+	PID             int    `json:"pid"`
 	Service         string `json:"service"`
 	Version         string `json:"version"`
 	UptimeSeconds   int64  `json:"uptime_seconds"`
@@ -171,6 +173,7 @@ func (a *App) health() Health {
 	a.bridge.mu.Lock()
 	h := Health{Service: "running", Version: version, UptimeSeconds: int64(time.Since(a.started).Seconds()), Address: fmt.Sprintf("127.0.0.1:%d", a.config.Port), PageConnected: a.bridge.active != nil, Ready: a.bridge.ready, ToolCount: len(a.bridge.tools), PendingRequests: len(a.bridge.pending) + len(a.bridge.queue)}
 	a.bridge.mu.Unlock()
+	h.PID = os.Getpid()
 	for range a.mcp.Sessions() {
 		h.MCPSessions++
 	}

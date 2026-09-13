@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 type Config struct {
 	Port           int      `json:"port"`
@@ -19,11 +19,24 @@ type Config struct {
 }
 
 func dataDir() string {
-	root := os.Getenv("ProgramData")
+	if root := os.Getenv("QBMCP_HOME"); root != "" {
+		absolute, err := filepath.Abs(root)
+		if err == nil {
+			return absolute
+		}
+	}
+	root := os.Getenv("LOCALAPPDATA")
 	if root == "" {
-		root = `C:\ProgramData`
+		root, _ = os.UserConfigDir()
 	}
 	return filepath.Join(root, "qbmcp")
+}
+
+func installDir() string {
+	if os.Getenv("QBMCP_HOME") != "" {
+		return filepath.Join(dataDir(), "bin")
+	}
+	return filepath.Join(os.Getenv("LOCALAPPDATA"), "Programs", "qbmcp")
 }
 
 func configPath() string { return filepath.Join(dataDir(), "config.json") }

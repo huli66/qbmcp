@@ -4,5 +4,7 @@ package main
 
 import "fmt"
 
-func runService() error                     { return fmt.Errorf("Windows 服务仅支持 Windows") }
-func manageService(string, int, bool) error { return fmt.Errorf("Windows 服务仅支持 Windows") }
+func runWatch(bool) error { return fmt.Errorf("后台运行仅支持 Windows") }
+
+func runBackground() error               { return fmt.Errorf("后台运行仅支持 Windows") }
+func manageUser(string, int, bool) error { return fmt.Errorf("后台运行仅支持 Windows") }

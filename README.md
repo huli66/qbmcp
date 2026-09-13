@@ -1,77 +1,137 @@
 # qbmcp
 
-用 Go 编写的 Windows 常驻 MCP 服务：多个本地 agent 通过 MCP 连接服务，一个网页通过 WebSocket 提供工具。网页负责请求业务接口、执行 DOM 操作，Go 负责工具注册、参数校验、排队和结果路由。
+Go 编写的用户级 Windows 后台 MCP 程序。多个本地 agent 通过 MCP 连接，一个网页通过 WebSocket 提供 API 数据和 DOM 操作工具。
 
-## 实施计划与当前状态
+**v0.2 默认使用当前用户计划任务，安装、启停、登录启动及完整状态查询均无需管理员权限。** 从 v0.1 Windows 服务迁移时，仅停用旧系统服务需要一次管理员权限。
 
-本文件是后续 goal 模式的实施和验收依据。代码已经实现首版功能；**自动化链路已验证，真实 Windows 服务恢复、开机启动和 Codex 会话仍需人工验收**，不应将这些项目视为已通过。
+## 安装和快速开始
 
-```text
-Codex / 其他本地 agent（多个）
-              │ MCP / Streamable HTTP
-              ▼
-      qbmcp Windows 服务
-      ├─ MCP 工具注册与调用
-      ├─ WebSocket 连接管理
-      ├─ 内存 schema 与请求路由
-      └─ /health 状态查询
-              ▲
-              │ WebSocket（唯一活动网页）
-              │
-         HTML / 业务网页
-         ├─ 注册工具 schema
-         ├─ fetch 接口并返回数据
-         └─ DOM 操作并返回结果
-```
-
-### 目标和边界
-
-- 编译为单个 `qbmcp.exe`，HTML 通过 Go embed 嵌入，无需 Node.js 或浏览器插件即可运行。
-- agent 连接已经运行的服务，不负责启动或维持服务进程；agent 退出不影响网页连接。
-- 网页主动连接并注册工具；服务不自动打开浏览器。
-- 首版面向 Windows 10/11、本地 HTTP 测试页面及支持 Streamable HTTP 的本地 agent。
-- 暂不包含 HTTPS 网站/TLS 证书、远程访问、stdio 桥接、多网页路由和任意 JavaScript 执行。
-- 电脑休眠、浏览器关闭或页面冻结期间不能保证连接；恢复后需要重连并重新注册。
-
-### 按阶段推进
-
-- [x] **项目基础**：Go 模块、固定依赖版本、配置、滚动日志、命令入口、HTTP 路由。
-- [x] **网页桥接**：认证、schema 校验、单网页替换、请求关联、FIFO 队列、取消与超时、示例页面。
-- [x] **MCP 接入**：两个内置工具、动态工具、工具列表变化通知、多客户端集成测试。
-- [x] **Windows 常驻实现**：服务注册、LocalService 身份、受保护安装目录、启停、开机启动和失败恢复代码，Windows 构建通过。
-- [ ] **最终验收**：CGO 竞态检查、真实服务恢复、实际重启电脑、浏览器和 Codex 联调；按下方清单记录结果。
-
-goal 完成标准：单个可执行文件通过全部验收场景，并在本文件记录真实验证结果。缺少环境的验收不能用模拟测试代替。
-
-## 编译和快速开始
-
-需要 Go 1.24.3 或更高版本。运行服务不需要安装 Go。
+需要 Windows 10/11、系统自带的 Windows PowerShell 5.1 和任务计划程序服务。运行时无需 Go、Node.js 或第三方守护程序。编译需要 Go 1.24.3 或更高版本。
 
 ```powershell
-go mod download
-go test ./... -count=1
-go vet ./...
 go build -trimpath -ldflags "-s -w" -o dist/qbmcp.exe .
+# 普通 PowerShell 中安装；已使用旧服务的用户先看下方迁移步骤
+.\install.ps1 -Enable -Start
+qbmcp help
+qbmcp status
 ```
 
-在**管理员 PowerShell** 中启动：
+安装脚本复制 exe、添加用户 PATH，并刷新当前 PowerShell 的 PATH；其他已经打开的终端/应用需要重新打开。也可以直接运行：
 
 ```powershell
-.\dist\qbmcp.exe start
-.\dist\qbmcp.exe enable
-.\dist\qbmcp.exe status
+.\dist\qbmcp.exe install
+# 重新打开普通终端
+qbmcp enable
+qbmcp start
 ```
 
-首次注册会将程序复制到 `%ProgramData%\qbmcp\bin\qbmcp.exe`，Windows 服务固定使用该副本。服务账户为 `NT AUTHORITY\LocalService`。普通用户可以查询服务状态，但读取受保护配置并查询自定义端口的详细状态需要管理员权限。
+如果执行策略阻止本地脚本，可以仅对本次脚本进程使用：
 
-1. 从 `%ProgramData%\qbmcp\config.json` 取得 `token`。
-2. 打开 [本地测试页面](http://127.0.0.1:32300/demo)，粘贴 token，点击“连接”。
-3. 页面显示“工具已就绪”后，配置 MCP 客户端。
-4. 让 agent 调用 `demo_load_data`，或者调用 `demo_set_text` 修改页面文字。
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Enable -Start
+# 此方式无法修改父终端环境，结束后请重新打开终端
+```
 
-### Codex 配置
+安装脚本不带参数时只安装，不立即启动、不默认开启登录启动。安装目录和运行数据分开：
 
-将以下配置合并到 Codex 的 `config.toml`，不要覆盖原有配置：
+| 内容 | 默认位置 |
+|---|---|
+| 全局命令 | `%LOCALAPPDATA%\Programs\qbmcp\qbmcp.exe` |
+| 配置/token | `%LOCALAPPDATA%\qbmcp\config.json` |
+| 滚动日志 | `%LOCALAPPDATA%\qbmcp\logs\qbmcp.log` |
+| 运行状态 | `%LOCALAPPDATA%\qbmcp\runtime.json` |
+
+打开 [测试页面](http://127.0.0.1:32300/demo)，从配置文件取得 token，粘贴并连接。页面显示工具已就绪后，agent 可以调用 `demo_load_data` 和 `demo_set_text`。
+
+### 从 v0.1 Windows 服务迁移
+
+新版检测到旧的 `qbmcp` 系统服务时，拒绝默认安装/启动，避免两套程序争用端口。迁移脚本只针对旧版标准安装路径，不会操作同名的其他程序。
+
+1. 用**同一 Windows 账户的管理员 PowerShell**执行：
+
+```powershell
+.\migrate-service.ps1
+```
+
+2. 关闭管理员终端，在**普通 PowerShell**中执行：
+
+```powershell
+.\install.ps1 -Enable -Start
+```
+
+迁移脚本将旧配置和 token 复制到用户数据目录，禁用、停止并注销旧服务；保留 ProgramData 中的原程序、配置及日志。用户目录若已有不同的 config.json，会停止迁移，避免覆盖已有配置；相同配置允许中断后重试。迁移保持原端口、token 和 Origin 设置，MCP URL 和凭据通常无需修改。
+
+如果迁移中断，先核对脚本输出、旧服务状态及两份配置；不要盲目删除文件。旧服务被标记删除后，如果新安装仍提示存在旧服务，请关闭“服务”管理窗口及旧版状态查询程序后再试。
+
+## 命令与后台生命周期
+
+| 命令 | 行为 |
+|---|---|
+| `install` | 安装/更新用户目录中的程序，注册计划任务并加入用户 PATH；保留已有登录启动设置 |
+| `start [--port N]` | 首次自动准备配置和任务，然后由计划任务启动隐藏后台进程；重复执行不增加进程 |
+| `stop` | 正常结束当前进程，取消当前任务运行，保留登录启动配置 |
+| `enable [--port N]` | 添加当前用户登录触发器，不立即启动、不重启当前进程 |
+| `disable` | 移除登录触发器，不停止当前进程，也不关闭异常恢复 |
+| `status [--json]` | 显示用户任务、进程、端口、网页、工具和 MCP 会话状态 |
+| `uninstall` | 停止程序、删除本用户任务、移除本安装目录的 PATH 条目；保留程序文件、配置和日志 |
+| `help` | 显示帮助 |
+
+- 后台进程由 Windows 任务计划程序发起，与启动它的终端和 agent 生命周期分离。主任务负责运行，独立的 `-logon` 小任务仅在登录时启动主任务；`-watch` 任务每分钟检查是否需要恢复退出的进程。enable/disable 只调整登录任务，不重新注册运行中的主任务。
+- 任务以当前用户的普通权限运行，不保存账户密码，不请求最高权限；用户未登录时不会运行。
+- exe 由隐藏 PowerShell 包装进程同步执行。工作进程监视包装进程：包装进程异常结束时，工作进程也会退出，防止留下无人管理的进程。
+- 任务不设置最长运行时间，使用电池时继续运行；Windows 休眠期间仍无法处理请求。
+- 工作进程或包装进程异常退出后，独立定时任务在下一次约一分钟的检查中恢复进程。主任务同时配置了 Windows 原生失败重试，但实际恢复不只依赖它。只有本次 Windows 启动中用户要求运行，才允许恢复；检查任务自身退出后，下一次定时触发仍可继续检查。
+- 端口冲突、配置错误等确定性启动失败记录到日志和 status，并正常退出，不进行持续失败重试。
+- disable 后定时检查任务仍保留，以便恢复本次手动运行的进程；重新启动 Windows 后旧运行意图失效，没有登录启动任务就不会启动 MCP 进程。uninstall 会移除主任务及两个辅助任务。
+- `stop` 写入与本次 Windows 启动绑定的停止标记，阻止已排队的恢复重新提供服务。`start` 清除标记；重新启动 Windows 后旧标记失效，已 enable 的任务在用户登录时启动。同一次 Windows 启动内退出账户再登录仍保留主动停止状态。
+- 管理命令与后台进程分别使用用户及数据目录隔离的系统互斥锁；所有路径、任务名称和内核对象按用户隔离。
+- `_run --data-dir ...` 是计划任务内部入口，日常请使用 start。
+- PATH 只修改当前用户，去重并保留其他条目；uninstall 只移除本程序的确切目录。
+- 程序与配置目录仅当前用户、管理员和 SYSTEM 可访问，不再依赖 LocalService 或 ProgramData 权限。
+
+更新版本：
+
+```powershell
+qbmcp stop
+.\install.ps1
+qbmcp start
+```
+
+更换端口：
+
+```powershell
+qbmcp stop
+qbmcp start --port 32301
+qbmcp status --json
+```
+
+运行中拒绝修改端口；不指定端口则保留当前配置。更换后同步修改网页地址和 MCP URL。
+
+### 隔离测试目录
+
+设置 `QBMCP_HOME` 可选择独立数据目录；其程序安装到该目录的 bin，计划任务名称也随目录变化。这用于隔离测试或多配置，不与默认实例共享状态。不要为两个实例配置同一端口。测试目录名称支持空格、中文和单引号。
+
+## 配置与 Codex 接入
+
+配置文件为 `%LOCALAPPDATA%\qbmcp\config.json`：
+
+```json
+{
+  "port": 32300,
+  "token": "初始化自动生成的64位十六进制字符串",
+  "allowed_origins": []
+}
+```
+
+- 默认仅监听 `127.0.0.1:32300`，HTTP、MCP、WebSocket 和演示页面共用端口。
+- token 为 32 字节密码学随机值。网页通过第一条 hello 消息认证，MCP 使用 Bearer token；凭据不放在 URL、源码或日志中。
+- 默认允许本服务 localhost/127.0.0.1 对应端口的 HTTP Origin；额外开发页面通过 allowed_origins 显式加入，例如 `http://localhost:5173`。
+- 不允许通配符、空 WebSocket Origin、file:// 页面或远程 Origin。Host 同样校验。
+- 配置修改后重启。修改 token 后更新网页和 agent 的凭据。
+- 日志每份 5 MiB、最多 3 个备份，保留 14 天并压缩。
+- 首版不包含 HTTPS/TLS 适配、远程访问、stdio 桥接和多网页路由。
+
+将以下内容合并到 Codex config.toml：
 
 ```toml
 [mcp_servers.qbmcp]
@@ -80,69 +140,15 @@ bearer_token_env_var = "QBMCP_TOKEN"
 tool_timeout_sec = 45
 ```
 
-在启动 Codex 的环境中设置 `QBMCP_TOKEN`。例如，在能读取配置的终端内：
+普通用户现在可以读取自己的配置：
 
 ```powershell
-$qbConfig = Get-Content "$env:ProgramData\qbmcp\config.json" -Raw | ConvertFrom-Json
+$qbConfig = Get-Content "$env:LOCALAPPDATA\qbmcp\config.json" -Raw | ConvertFrom-Json
 $env:QBMCP_TOKEN = $qbConfig.token
-# 此后从继承该环境变量的环境启动 Codex。
+# 从继承该环境变量的环境启动 Codex
 ```
 
-已经运行的桌面应用不会自动取得这个终端中新设置的环境变量。配置后重新连接 MCP，必要时重启客户端。
-
-Codex 的 URL/Bearer token 配置依据[官方 MCP 接入文档](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)。其他 agent 使用相同的 MCP URL 和 `Authorization: Bearer <token>`。
-
-## 命令和 Windows 生命周期
-
-| 命令 | 行为 |
-|---|---|
-| `start [--port N]` | 未注册则注册为手动启动服务，然后启动；已经运行则幂等返回 |
-| `stop` | 正常停止，不触发异常恢复；保留开机启动设置 |
-| `enable [--port N]` | 未注册则注册，设置开机自动启动；不立即启动 |
-| `disable` | 设置为手动启动；不停止服务，也不禁止手动 start |
-| `status [--json]` | 查询 Windows 服务状态、启动类型、PID 和可取得的连接信息 |
-| `help` | 显示帮助 |
-
-- 使用 Windows SCM 保证服务单实例，管理命令通过系统互斥锁串行执行。
-- 异常退出由 SCM 按 5 秒、15 秒、60 秒延迟恢复，此后重复 60 秒；无故障 24 小时后重置计数。
-- 正常 `stop` 报告停止状态，不触发恢复。之前执行过 `enable` 时，下一次开机仍会启动。
-- `stop` 还保存与本次 Windows 启动标识绑定的停止标记，阻止已经排队的失败恢复重新提供服务；`start` 清除标记，新一轮 Windows 启动自动忽略旧标记。
-- 配置错误或端口占用会记录启动错误并正常报告失败，不进行无限失败重启。
-- `enable/disable` 和进程失败恢复互相独立；disable 后手动启动的服务仍有异常恢复。
-- 停止后从新版程序运行 `start` 会更新受保护的程序副本，再启动服务。不要在运行中覆盖已安装的可执行文件。
-- `service` 是内部入口，仅供 SCM 调用，不能当作前台服务器运行。
-
-修改端口：
-
-```powershell
-.\dist\qbmcp.exe stop
-.\dist\qbmcp.exe start --port 32301
-.\dist\qbmcp.exe status --json
-```
-
-随后同时修改网页地址和 agent 的 MCP URL。端口持久化，运行中不能修改端口。不传 `--port` 时保留已有设置。
-
-## 配置和本地访问保护
-
-配置文件：`%ProgramData%\qbmcp\config.json`。
-
-```json
-{
-  "port": 32300,
-  "token": "首次初始化自动生成的64位十六进制字符串",
-  "allowed_origins": []
-}
-```
-
-- 默认绑定 `127.0.0.1:32300`；MCP、WebSocket、健康检查及示例页面共用端口。
-- token 是 32 字节密码学随机数。MCP 使用 Bearer token，网页在第一条 WebSocket 消息中发送 token。
-- token 不放在 URL、HTML 源码或日志里。演示页面仅将其保存在当前页面内存。
-- 默认允许 `http://127.0.0.1:<port>` 和 `http://localhost:<port>` 两个 Origin。WebSocket 不接受空 Origin、`null` 或通配符。
-- 其他本地开发页面可以在 `allowed_origins` 添加完整 Origin，例如 `http://localhost:5173`；首版仅接受 localhost/127.0.0.1 的 HTTP Origin。
-- 修改配置后重启服务。更换 token 后网页和 agent 都需要更新凭据。
-- Host 仅接受配置端口的 localhost/127.0.0.1；非允许的浏览器 Origin 返回 403。
-- 配置和程序目录仅管理员、SYSTEM 可写，LocalService 可读；日志目录另行授予 LocalService 写权限。
-- 滚动日志位于 `%ProgramData%\qbmcp\logs\qbmcp.log`：每份 5 MiB，最多 3 个备份，保留 14 天并压缩。
+已经运行的应用不会自动取得这个终端设置的变量。设置后重连 MCP，必要时重新启动客户端。[Codex 官方 MCP 文档](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 
 ## MCP 工具
 
@@ -276,7 +282,8 @@ Codex 的 URL/Bearer token 配置依据[官方 MCP 接入文档](https://learn.c
 ```json
 {
   "service": "running",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "pid": 12345,
   "uptime_seconds": 120,
   "address": "127.0.0.1:32300",
   "page_connected": true,
@@ -289,7 +296,7 @@ Codex 的 URL/Bearer token 配置依据[官方 MCP 接入文档](https://learn.c
 
 `tool_count` 只统计网页工具，不包含两个内置工具。`ready` 表示当前连接已成功注册工具快照（允许空快照）。网页未连接仍返回 HTTP 200，但 `page_connected`、`ready` 为 false。
 
-`status` 先查询 SCM，再查询健康接口，明确区分“服务停止”“服务运行但健康接口不可达”和“网页未连接”。
+`status` 查询当前用户的计划任务、进程创建时间和健康接口，区分未安装、已停止、启动中、运行中、等待恢复及启动失败。PID 与创建时间共同校验，避免 PID 被复用时误认其他程序；健康接口的 PID 也必须匹配。
 
 ## 示例页面
 
@@ -300,56 +307,70 @@ Codex 的 URL/Bearer token 配置依据[官方 MCP 接入文档](https://learn.c
 - 提供 token 输入、连接/断开、状态、工具定义和最多 100 条请求日志。
 - 应通过服务访问 `/demo`，不要直接用 `file://` 打开；后者的 Origin 不符合默认限制。
 
-## 验证记录与待办
+## 实施进度与验证记录
 
-2026-09-12，本地 Windows amd64 / Go 1.24.3：
+本 README 继续作为后续 goal 模式的验收依据。v0.2 已将 Windows 系统服务替换为当前用户计划任务，MCP 和网页协议保持兼容。
 
-- [x] `go test ./... -count=1 -timeout=60s`：通过。
-- [x] `go vet ./...`：通过。
-- [x] 编译 `dist/qbmcp.exe`：通过。
-- [x] 可执行文件 help、未注册状态查询和非法端口提示：通过。
-- [x] `node --test web/demo.test.cjs`：4 项通过，覆盖演示页握手、API/DOM handler、取消和重连；这是可选的开发测试，不是运行依赖，也不替代真实浏览器验收。
-- [x] Windows 启动标识只读检查及停止标记生命周期测试：通过，未修改系统服务。
-- [x] 无网页时只有两个内置工具，发现工具返回未连接错误。
-- [x] 真实 HTTP/WebSocket + 官方 Go MCP 客户端集成链路，两客户端并发调用且结果不串线。
-- [x] agent 先连接、网页后注册，接收到动态工具列表通知；动态入口与通用入口均可调用。
-- [x] 关闭 MCP 客户端不影响网页连接；网页断开清除工具。
-- [x] 新网页替换旧网页，未完成请求失败，旧连接收到 4001。
-- [x] 错误 token/Origin 不替换已有网页；Host 校验、健康接口和演示源码不泄露 token。
-- [x] 非法 schema、重复名称和保留名称保持旧工具快照；拒绝外部 schema 引用。
-- [x] 非法参数、非法返回值、超时、取消、迟到结果、队列满、排队期间 schema 更新及 4 MiB 上限。
-- [ ] `go test -race ./...`：当前 `CGO_ENABLED=0` 且未找到 GCC；需要安装支持 Go race 的 Windows C 编译器后设置 `CGO_ENABLED=1`、`CC` 并运行。
-- [ ] 真实管理员服务测试：当前运行环境不是管理员，未注册或修改本机 Windows 服务。
-- [ ] 真实浏览器操作两个演示工具，观察 API 数据和 DOM 结果。
-- [ ] 真实 Codex 会话的工具刷新与通用入口回退。
-- [ ] 实际重启电脑验证开机启动。
+- [x] Go 模块、配置、日志、单 exe 嵌入 HTML。
+- [x] 网页认证、动态 schema、单网页替换、FIFO 队列、取消和超时。
+- [x] MCP 两个稳定入口、动态工具、多客户端与变更通知。
+- [x] 用户目录安装、用户 PATH、任务管理、登录触发器和进程恢复实现。
+- [x] 旧 Windows 服务迁移脚本，保留原配置。
+- [ ] 完成下列真实系统和客户端验收后，标记整体目标完成。
 
-### Windows / Codex 人工验收步骤
+2026-09-13，Windows amd64 / Go 1.24.3：
 
-在专用测试环境或确认没有正在使用的 qbmcp 服务后执行：
+- [x] Go 单元/集成测试：MCP、WebSocket、并发请求路由、schema、限流、取消、超大消息等原有测试通过。
+- [x] 用户路径和配置、PATH 去重/移除、互斥锁串行化、PID 创建时间及停止标记测试通过。
+- [x] 真实普通用户（非管理员）安装、PATH 去重、启停、登录开关、工作进程崩溃恢复、主动停止超过一分钟不重启、端口占用报错及卸载清理：通过（TestUserTaskLifecycle，136.76 秒）。原用户 PATH 恢复，独立测试任务已删除。
+- [x] 包装进程终止后没有遗留孤立工作进程，约一分钟后恢复：通过（TestUserWrapperRecovery，63.85 秒）。两项真实系统测试合计 201.235 秒。
+- [x] 最终 Windows 构建、go vet、Go 回归测试、4 项网页逻辑测试及三个 PowerShell 脚本语法检查：通过。
+- [ ] 真实旧服务迁移：需要一次管理员运行迁移脚本；本次开发未自动停用现有旧服务。
+- [ ] 实际重新登录/重启 Windows，验证登录启动。
+- [ ] 真实浏览器和 Codex 会话操作两个演示工具。
+- [ ] CGO 竞态检查：此前环境无可用 GCC，需配置 Windows C 编译器后执行。
 
-1. 管理员终端执行 `start`，检查 `/health`、`status --json`、服务账户和安装路径；重复 start 不增加进程。
-2. 打开 `/demo` 并连接，配置 Codex；调用两类示例工具。再连接第二个 agent，核对各自结果。
-3. 关闭所有 agent，确认网页和服务仍连接；再打开第二个测试页，确认第一个显示被替换且不自动抢回。
-4. 执行 `enable`，确认当前 PID 不变；执行 `disable`，确认进程仍运行。
-5. 保持 disable，强制结束**status 返回的 qbmcp 服务 PID**，确认约 5 秒后恢复；不要结束不属于本服务的进程。
-6. 执行 stop，等待超过 60 秒，确认不恢复；另测试强制终止后在恢复等待期立即 stop，确认仍不恢复。再执行 start，确认可手动运行。
-7. stop 后改端口并 start，确认新地址可用；服务运行时尝试修改端口，应明确报错。
-8. stop 后用测试监听器占用配置端口再 start，确认正常报告启动失败且日志记录原因；释放端口后可正常启动。
-9. 执行 enable，再 stop，重启 Windows，确认开机启动；执行 disable，再重启，确认不自动启动。
-10. 把实际系统版本、客户端版本、执行日期和结果更新到本节，再勾选最终验收项。
+自动化验证：
 
-### 排障
+```powershell
+go test ./... -count=1 -timeout=60s
+go vet ./...
+node --test web/demo.test.cjs
+# 需要兼容的 C 编译器：
+$env:CGO_ENABLED = '1'
+go test -race ./...
+```
+
+可选的真实任务测试（普通用户运行，会创建独立临时任务和 PATH 条目并在结束时清理，耗时数分钟，不操作旧服务或默认实例）：
+
+```powershell
+go build -o dist/qbmcp.exe .
+$env:QBMCP_LIFECYCLE_TEST = '1'
+go test -run '^TestUser(TaskLifecycle|WrapperRecovery)$' -v -count=1 -timeout=7m
+Remove-Item Env:QBMCP_LIFECYCLE_TEST
+```
+
+人工验收：
+
+1. 普通终端安装，重新打开终端后直接运行 qbmcp help/status；确认任务以当前用户普通权限运行。
+2. start 后关闭终端/agent，检查网页和后台连接仍保持；两个 agent 分别调用工具。
+3. enable/disable 时 PID 不变；登录启动与异常恢复互相独立。
+4. 用 status 确认本实例 PID 后测试异常退出，约一分钟恢复；主动 stop 后超过一分钟仍不恢复。
+5. 更换端口后重启保留设置；端口被占用时明确失败而非反复重启。
+6. enable、stop，再重启 Windows 并登录，应自动启动；disable 后重启登录不应启动。
+7. 新网页接管后旧网页不自动抢回，旧请求不串线。
+8. uninstall 后任务和本安装目录的 PATH 条目消失，用户配置仍保留。
+
+## 排障
 
 | 现象 | 检查 |
 |---|---|
-| 管理命令权限不足 | 使用管理员终端；普通用户状态查询可能无法读取配置 |
-| 启动失败 | 查看滚动日志；确认配置合法、端口未占用 |
-| 网页认证失败 | 核对当前 config.json 的 token；修改后需要重启服务 |
-| WebSocket 403 | 使用服务 `/demo` 地址，检查 Origin 配置，不要用 file:// |
-| 网页连不上本地服务 | 检查浏览器本地网络访问权限、服务状态和端口 |
-| agent 看不到新增工具 | 先用 discover，再通过 qbmcp_call_tool 调用；必要时重连 MCP |
-| 工具超时 | 保持页面活跃，检查页面日志及 API 请求；操作可能已发生，不应盲目重试 |
-| 更新程序后仍是旧版本 | stop 后从新构建的 exe 执行 start，检查 /health 版本 |
-
-核心代码按配置、桥接、HTTP/MCP、Windows 生命周期拆分；测试不需要安装 Windows 服务。后续扩展应继续保持服务生命周期独立于 agent，并保留两个稳定的内置工具。
+| 提示旧 Windows 服务存在 | 先按迁移步骤运行一次管理员脚本，再回到普通终端安装 |
+| 找不到 qbmcp 命令 | 运行 install，并重新打开终端；其他应用可能也需重启以刷新 PATH |
+| 计划任务操作被拒绝 | 检查系统任务计划程序服务及组织策略；不要改用管理员长期运行来掩盖权限问题 |
+| 状态 recovering | 异常退出后的恢复等待期；约一分钟后检查，持续失败则查看日志 |
+| 状态 failed | 查看 status 错误和用户目录日志，修复配置/端口问题后 start |
+| 网页认证失败 | 检查用户配置中的 token，修改配置后重启 |
+| WebSocket 403 | 通过 /demo 访问，检查 Origin，不要直接双击 HTML 使用 file:// |
+| 新动态工具不可见 | 先 discover，再用 qbmcp_call_tool；必要时重新连接 MCP |
+| 工具超时 | 保持页面活跃，检查网页/API 日志；操作可能已经发生，不要盲目重试 |
