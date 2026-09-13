@@ -3,7 +3,6 @@
 package main
 
 import (
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,33 +74,18 @@ func managedExecutable() error {
 	if err = protectUserDir(dir); err != nil {
 		return err
 	}
-	dst := filepath.Join(dir, "qbmcp.exe")
-	if strings.EqualFold(filepath.Clean(src), filepath.Clean(dst)) {
-		return nil
-	}
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	if old, e := os.ReadFile(dst); e == nil && sha256.Sum256(old) == sha256.Sum256(data) {
-		return nil
-	}
-	if state, _ := readRuntime(); runtimeAlive(state) {
-		return fmt.Errorf("更新程序前请先 qbmcp stop")
-	}
-	f, err := os.CreateTemp(dir, "qbmcp-*.tmp")
+	background, err := backgroundImage(data)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(f.Name())
-	if _, err = f.Write(data); err != nil {
-		f.Close()
+	if err = installImage(filepath.Join(dir, "qbmcp.exe"), data); err != nil {
 		return err
 	}
-	if err = f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), dst)
+	return installImage(backgroundPath(), background)
 }
 
 // Preserve unrelated PATH entries and expandable registry values.
@@ -147,26 +131,6 @@ func updateUserPath(add bool) error {
 	var ignored uintptr
 	windows.NewLazySystemDLL("user32.dll").NewProc("SendMessageTimeoutW").Call(0xffff, 0x001a, 0, uintptr(unsafe.Pointer(environment)), 2, 2000, uintptr(unsafe.Pointer(&ignored)))
 	return nil
-}
-func checkLegacy() error {
-	if os.Getenv("QBMCP_HOME") != "" {
-		return nil
-	}
-	h, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
-	if err != nil {
-		return err
-	}
-	defer windows.CloseServiceHandle(h)
-	name, _ := windows.UTF16PtrFromString("qbmcp")
-	sh, err := windows.OpenService(h, name, windows.SERVICE_QUERY_STATUS)
-	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	windows.CloseServiceHandle(sh)
-	return fmt.Errorf("检测到旧版 qbmcp Windows 服务。请先按 README 用管理员权限运行 migrate-service.ps1；新版日常操作无需管理员权限")
 }
 func stopUser() error {
 	if _, err := os.Stat(dataDir()); !errors.Is(err, os.ErrNotExist) {
@@ -227,9 +191,6 @@ func manageUser(command string, port int, asJSON bool) error {
 		}
 		return nil
 	}
-	if err = checkLegacy(); err != nil {
-		return err
-	}
 	task, err := scheduler("query", nil)
 	if err != nil {
 		return err
@@ -258,6 +219,20 @@ func manageUser(command string, port int, asJSON bool) error {
 	}
 	if _, err = prepareConfig(port); err != nil {
 		return err
+	}
+	// Quiesce the short-lived watchdog during a stopped install/update so it
+	// cannot hold the background image open while waiting for our mutex.
+	if !active && task.WatchInstalled {
+		if _, err = scheduler("pause_watch", nil); err != nil {
+			return err
+		}
+		defer func() {
+			if task.WatchEnabled {
+				if _, e := scheduler("resume_watch", nil); e != nil {
+					fmt.Fprintln(os.Stderr, "恢复检查任务失败，请重新执行 install:", e)
+				}
+			}
+		}()
 	}
 	if err = managedExecutable(); err != nil {
 		return err
@@ -341,78 +316,4 @@ func waitUserReady() error {
 		time.Sleep(150 * time.Millisecond)
 	}
 	return fmt.Errorf("启动超时，请用 qbmcp status 检查用户计划任务和日志")
-}
-
-type UserStatus struct {
-	Mode      string     `json:"mode"`
-	State     string     `json:"state"`
-	Autostart bool       `json:"autostart"`
-	Task      TaskStatus `json:"task"`
-	PID       int        `json:"pid,omitempty"`
-	DataDir   string     `json:"data_dir"`
-	Health    *Health    `json:"health,omitempty"`
-	Error     string     `json:"error,omitempty"`
-}
-
-func queryUserStatus() (UserStatus, error) {
-	result := UserStatus{Mode: "user", State: "not_installed", DataDir: dataDir()}
-	task, err := scheduler("query", nil)
-	if err != nil {
-		return result, err
-	}
-	result.Task = task
-	result.Autostart = task.Autostart
-	state, readErr := readRuntime()
-	if runtimeAlive(state) {
-		result.State = state.State
-		result.PID = state.PID
-		c, e := loadConfig()
-		if e != nil {
-			result.Error = e.Error()
-			return result, nil
-		}
-		result.Health, e = getHealth(c, state.PID)
-		if e != nil {
-			result.Error = "后台进程存在，但健康接口不可用: " + e.Error()
-		}
-	} else if task.Installed {
-		result.State = "stopped"
-		if task.State == 4 || task.State == 2 {
-			result.State = "starting"
-		}
-		if readErr == nil && state.State == "failed" {
-			result.State = "failed"
-			result.Error = state.Error
-		}
-		if readErr == nil && state.State == "running" {
-			result.State = "recovering"
-		}
-		if stopped, _ := stoppedThisBoot(); stopped {
-			result.State = "stopped"
-		}
-		if !bootFlag("desired-boot") {
-			result.State = "stopped"
-		}
-	}
-	return result, nil
-}
-func printUserStatus(asJSON bool) error {
-	state, err := queryUserStatus()
-	if err != nil {
-		return err
-	}
-	if asJSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(state)
-	}
-	fmt.Printf("模式: 当前用户\n状态: %s\n登录启动: %t\nPID: %d\n数据目录: %s\n", state.State, state.Autostart, state.PID, state.DataDir)
-	if state.Health != nil {
-		h := state.Health
-		fmt.Printf("地址: %s\n网页已连接: %t\n工具就绪: %t\n网页工具: %d\nMCP 会话: %d\n待处理请求: %d\n", h.Address, h.PageConnected, h.Ready, h.ToolCount, h.MCPSessions, h.PendingRequests)
-	}
-	if state.Error != "" {
-		fmt.Println(state.Error)
-	}
-	return nil
 }

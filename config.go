@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 )
 
-const version = "0.2.0"
+const version = "0.2.1"
 
 type Config struct {
 	Port           int      `json:"port"`

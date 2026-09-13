@@ -14,7 +14,7 @@ const usage = `qbmcp - 用户级 Windows 网页 MCP 桥接
   qbmcp stop                正常停止，不触发异常恢复
   qbmcp enable [--port N]   开启当前用户登录启动，不立即启动
   qbmcp disable             关闭登录启动，不停止后台程序
-  qbmcp status [--json]     查看后台程序及网页连接状态
+  qbmcp status [--json]     查看端口、路径、后台程序及网页连接状态
   qbmcp uninstall          停止并删除用户计划任务、移除 PATH，保留文件
   qbmcp help                显示帮助
 
@@ -25,7 +25,7 @@ const usage = `qbmcp - 用户级 Windows 网页 MCP 桥接
 默认测试页: http://127.0.0.1:32300/demo
 默认 MCP: http://127.0.0.1:32300/mcp
 端口修改前必须先 stop。stop 保留下次启动 Windows 后的登录启动设置。
-异常退出由用户计划任务按 1 分钟间隔恢复。旧 Windows 服务请先迁移。
+异常退出由用户计划任务按 1 分钟间隔恢复；后台入口不创建控制台窗口。
 `
 
 func main() {

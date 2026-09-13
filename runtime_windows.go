@@ -21,12 +21,13 @@ import (
 )
 
 type RuntimeStatus struct {
-	State        string    `json:"state"`
-	PID          int       `json:"pid"`
-	ProcessStart uint64    `json:"process_start"`
-	Port         int       `json:"port"`
-	Error        string    `json:"error,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ConsoleAttached bool      `json:"console_attached"`
+	State           string    `json:"state"`
+	PID             int       `json:"pid"`
+	ProcessStart    uint64    `json:"process_start"`
+	Port            int       `json:"port"`
+	Error           string    `json:"error,omitempty"`
+	UpdatedAt       time.Time `json:"updated_at"`
 }
 
 func atomicJSON(path string, value any) error {
@@ -189,7 +190,8 @@ func runBackground() error {
 	if err != nil {
 		return err
 	}
-	state := RuntimeStatus{State: "starting", PID: os.Getpid(), ProcessStart: stamp}
+	console, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetConsoleWindow").Call()
+	state := RuntimeStatus{State: "starting", PID: os.Getpid(), ProcessStart: stamp, ConsoleAttached: console != 0}
 	startupFailed := func(err error) error {
 		state.State = "failed"
 		state.Error = err.Error()
@@ -239,11 +241,6 @@ func runBackground() error {
 		return startupFailed(err)
 	}
 	defer listener.Close()
-	parent, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(os.Getppid()))
-	if err != nil {
-		return startupFailed(err)
-	}
-	defer windows.CloseHandle(parent)
 	a := newApp(c, logger)
 	server := &http.Server{Handler: a.handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 90 * time.Second, MaxHeaderBytes: 16384}
 	done := make(chan error, 1)
@@ -255,13 +252,13 @@ func runBackground() error {
 		return err
 	}
 	logger.Info("background started", "port", c.Port, "pid", state.PID)
-	parentOrStop := make(chan uint32, 1)
+	stopResult := make(chan uint32, 1)
 	go func() {
-		which, e := windows.WaitForMultipleObjects([]windows.Handle{stop, parent}, false, windows.INFINITE)
+		which, e := windows.WaitForSingleObject(stop, windows.INFINITE)
 		if e != nil {
 			which = windows.WAIT_FAILED
 		}
-		parentOrStop <- which
+		stopResult <- which
 	}()
 	var runErr error
 	watcherDone := false
@@ -270,16 +267,16 @@ func runBackground() error {
 		if runErr == nil {
 			runErr = errors.New("HTTP server exited unexpectedly")
 		}
-	case which := <-parentOrStop:
+	case which := <-stopResult:
 		watcherDone = true
 		if which != windows.WAIT_OBJECT_0 {
-			runErr = errors.New("scheduler wrapper exited")
+			runErr = errors.New("stop event wait failed")
 		}
 	}
 	// Also wakes the watcher if the HTTP server was the first to exit.
 	_ = windows.SetEvent(stop)
 	if !watcherDone {
-		<-parentOrStop
+		<-stopResult
 	}
 	a.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)

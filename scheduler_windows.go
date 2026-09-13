@@ -27,12 +27,14 @@ import (
 var schedulerScript string
 
 type TaskStatus struct {
+	WatchEnabled   bool   `json:"watch_enabled"`
 	WatchInstalled bool   `json:"watch_installed"`
 	Installed      bool   `json:"installed"`
 	Name           string `json:"name"`
 	State          int    `json:"state"`
 	Autostart      bool   `json:"autostart"`
 	LastResult     int64  `json:"last_result"`
+	Executable     string `json:"executable,omitempty"`
 }
 
 func currentSID() (string, error) {
@@ -70,14 +72,8 @@ func encodedPS(script string) string {
 	}
 	return base64.StdEncoding.EncodeToString(data)
 }
-func psLiteral(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }
-func runnerScript(exe, home string) string {
-	return runnerCommand(exe, home, "_run")
-}
-func runnerCommand(exe, home, command string) string {
-	// The scheduler owns this hidden wrapper. The Go worker watches its parent,
-	// so killing the wrapper cannot leave an unsupervised worker behind.
-	return "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; try { & " + psLiteral(exe) + " " + psLiteral(command) + " '--data-dir' " + psLiteral(home) + "; exit $LASTEXITCODE } catch { exit 1 }"
+func backgroundArguments(command string) string {
+	return command + " --data-dir " + syscall.EscapeArg(dataDir())
 }
 func scheduler(action string, enabled *bool) (TaskStatus, error) {
 	var status TaskStatus
@@ -89,8 +85,7 @@ func scheduler(action string, enabled *bool) (TaskStatus, error) {
 	if err != nil {
 		return status, err
 	}
-	exe := filepath.Join(installDir(), "qbmcp.exe")
-	input, err := json.Marshal(map[string]any{"action": action, "name": name, "sid": sid, "home": dataDir(), "powershell": powershellPath(), "runner": encodedPS(runnerScript(exe, dataDir())), "logonRunner": encodedPS(runnerCommand(exe, dataDir(), "_autostart")), "watchRunner": encodedPS(runnerCommand(exe, dataDir(), "_watch")), "enabled": enabled})
+	input, err := json.Marshal(map[string]any{"action": action, "name": name, "sid": sid, "home": dataDir(), "executable": backgroundPath(), "runner": backgroundArguments("_run"), "logonRunner": backgroundArguments("_autostart"), "watchRunner": backgroundArguments("_watch"), "enabled": enabled})
 	if err != nil {
 		return status, err
 	}

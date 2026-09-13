@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -94,7 +93,7 @@ func TestProcessIdentityRejectsReusedPID(t *testing.T) {
 
 // This opt-in test creates a real per-user task under an isolated home, runs
 // actual crash recovery, and removes its task/PATH entry in cleanup. It does
-// not alter the legacy service or the default qbmcp profile.
+// not alter the default qbmcp profile.
 func TestUserTaskLifecycle(t *testing.T) {
 	if os.Getenv("QBMCP_LIFECYCLE_TEST") != "1" {
 		t.Skip("set QBMCP_LIFECYCLE_TEST=1 and build dist/qbmcp.exe to test Task Scheduler")
@@ -145,6 +144,9 @@ func TestUserTaskLifecycle(t *testing.T) {
 	if err != nil || !task.Installed || task.Autostart {
 		t.Fatalf("initial task: %+v %v", task, err)
 	}
+	if !task.WatchEnabled || !strings.EqualFold(task.Executable, backgroundPath()) {
+		t.Fatalf("task must run the native background executable directly: %+v", task)
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +159,13 @@ func TestUserTaskLifecycle(t *testing.T) {
 		t.Fatalf("runtime: %+v %v", state, err)
 	}
 	firstPID := state.PID
+	if state.ConsoleAttached {
+		t.Fatal("scheduled worker allocated a console")
+	}
+	status, err := queryUserStatus()
+	if err != nil || status.Port != port || status.Health == nil || status.PortSource != "runtime" {
+		t.Fatalf("running status: %+v %v", status, err)
+	}
 	command("start")
 	command("enable")
 	task, err = scheduler("query", nil)
@@ -209,6 +218,10 @@ func TestUserTaskLifecycle(t *testing.T) {
 	if runtimeAlive(state) {
 		t.Fatal("manual stop restarted")
 	}
+	status, err = queryUserStatus()
+	if err != nil || status.State != "stopped" || status.Port != port || status.Health != nil {
+		t.Fatalf("stopped status lost configuration: %+v %v", status, err)
+	}
 	command("start")
 	command("stop")
 	// A deterministic listen failure must be surfaced and not loop forever.
@@ -242,85 +255,3 @@ func TestUserTaskLifecycle(t *testing.T) {
 }
 
 func fmtInt(n int) string { return fmt.Sprintf("%d", n) }
-
-func TestUserWrapperRecovery(t *testing.T) {
-	if os.Getenv("QBMCP_LIFECYCLE_TEST") != "1" {
-		t.Skip("opt-in real Task Scheduler test")
-	}
-	exe, err := filepath.Abs(filepath.Join("dist", "qbmcp.exe"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("QBMCP_HOME", t.TempDir())
-	command := func(args ...string) {
-		t.Helper()
-		cmd := exec.Command(exe, args...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: windows.CREATE_NO_WINDOW}
-		if out, e := cmd.CombinedOutput(); e != nil {
-			t.Fatalf("%v: %v %s", args, e, out)
-		}
-	}
-	t.Cleanup(func() { command("uninstall") })
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	listener.Close()
-	command("start", "--port", fmtInt(port))
-	state, err := readRuntime()
-	if err != nil {
-		t.Fatal(err)
-	}
-	initial := state
-	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer windows.CloseHandle(snapshot)
-	entry := windows.ProcessEntry32{Size: uint32(unsafe.Sizeof(windows.ProcessEntry32{}))}
-	parentID := uint32(0)
-	for err = windows.Process32First(snapshot, &entry); err == nil; err = windows.Process32Next(snapshot, &entry) {
-		if entry.ProcessID == uint32(state.PID) {
-			parentID = entry.ParentProcessID
-			break
-		}
-	}
-	if parentID == 0 {
-		t.Fatal("worker parent missing")
-	}
-	parent, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, parentID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer windows.CloseHandle(parent)
-	var size uint32 = 32768
-	path := make([]uint16, size)
-	if err = windows.QueryFullProcessImageName(parent, 0, &path[0], &size); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.EqualFold(filepath.Base(windows.UTF16ToString(path[:size])), "powershell.exe") {
-		t.Fatal("unexpected parent; will not terminate")
-	}
-	t.Log("Terminating only the isolated task's PowerShell wrapper")
-	if err = windows.TerminateProcess(parent, 1); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(8 * time.Second)
-	for time.Now().Before(deadline) && runtimeAlive(initial) {
-		time.Sleep(100 * time.Millisecond)
-	}
-	if runtimeAlive(initial) {
-		t.Fatal("wrapper left an orphan worker")
-	}
-	t.Log("No orphan worker; waiting for scheduled wrapper recovery")
-	deadline = time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		state, _ = readRuntime()
-		if state.ProcessStart != initial.ProcessStart && state.State == "running" && runtimeAlive(state) {
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	t.Fatal("wrapper did not recover")
-}

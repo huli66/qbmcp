@@ -2,7 +2,7 @@
 
 Go 编写的用户级 Windows 后台 MCP 程序。多个本地 agent 通过 MCP 连接，一个网页通过 WebSocket 提供 API 数据和 DOM 操作工具。
 
-**v0.2 默认使用当前用户计划任务，安装、启停、登录启动及完整状态查询均无需管理员权限。** 从 v0.1 Windows 服务迁移时，仅停用旧系统服务需要一次管理员权限。
+**v0.2.1 使用当前用户计划任务，安装、启停、登录启动及完整状态查询均无需管理员权限。**
 
 ## 安装和快速开始
 
@@ -10,7 +10,7 @@ Go 编写的用户级 Windows 后台 MCP 程序。多个本地 agent 通过 MCP 
 
 ```powershell
 go build -trimpath -ldflags "-s -w" -o dist/qbmcp.exe .
-# 普通 PowerShell 中安装；已使用旧服务的用户先看下方迁移步骤
+# 普通 PowerShell 中安装
 .\install.ps1 -Enable -Start
 qbmcp help
 qbmcp status
@@ -37,31 +37,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Enable -S
 | 内容 | 默认位置 |
 |---|---|
 | 全局命令 | `%LOCALAPPDATA%\Programs\qbmcp\qbmcp.exe` |
+| 无控制台后台程序（安装时生成） | `%LOCALAPPDATA%\Programs\qbmcp\qbmcp-background.exe` |
 | 配置/token | `%LOCALAPPDATA%\qbmcp\config.json` |
 | 滚动日志 | `%LOCALAPPDATA%\qbmcp\logs\qbmcp.log` |
 | 运行状态 | `%LOCALAPPDATA%\qbmcp\runtime.json` |
 
 打开 [测试页面](http://127.0.0.1:32300/demo)，从配置文件取得 token，粘贴并连接。页面显示工具已就绪后，agent 可以调用 `demo_load_data` 和 `demo_set_text`。
-
-### 从 v0.1 Windows 服务迁移
-
-新版检测到旧的 `qbmcp` 系统服务时，拒绝默认安装/启动，避免两套程序争用端口。迁移脚本只针对旧版标准安装路径，不会操作同名的其他程序。
-
-1. 用**同一 Windows 账户的管理员 PowerShell**执行：
-
-```powershell
-.\migrate-service.ps1
-```
-
-2. 关闭管理员终端，在**普通 PowerShell**中执行：
-
-```powershell
-.\install.ps1 -Enable -Start
-```
-
-迁移脚本将旧配置和 token 复制到用户数据目录，禁用、停止并注销旧服务；保留 ProgramData 中的原程序、配置及日志。用户目录若已有不同的 config.json，会停止迁移，避免覆盖已有配置；相同配置允许中断后重试。迁移保持原端口、token 和 Origin 设置，MCP URL 和凭据通常无需修改。
-
-如果迁移中断，先核对脚本输出、旧服务状态及两份配置；不要盲目删除文件。旧服务被标记删除后，如果新安装仍提示存在旧服务，请关闭“服务”管理窗口及旧版状态查询程序后再试。
 
 ## 命令与后台生命周期
 
@@ -78,24 +59,41 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -Enable -S
 
 - 后台进程由 Windows 任务计划程序发起，与启动它的终端和 agent 生命周期分离。主任务负责运行，独立的 `-logon` 小任务仅在登录时启动主任务；`-watch` 任务每分钟检查是否需要恢复退出的进程。enable/disable 只调整登录任务，不重新注册运行中的主任务。
 - 任务以当前用户的普通权限运行，不保存账户密码，不请求最高权限；用户未登录时不会运行。
-- exe 由隐藏 PowerShell 包装进程同步执行。工作进程监视包装进程：包装进程异常结束时，工作进程也会退出，防止留下无人管理的进程。
+- 三个任务直接执行 qbmcp-background.exe，它使用 Windows GUI 子系统，从进程创建时就不分配控制台。安装时从同一份未签名 Go exe 生成后台副本；命令行 qbmcp.exe 仍可正常输出帮助和状态。任务管理所需的 PowerShell 由 Go 使用 CREATE_NO_WINDOW 启动，不会弹窗。
 - 任务不设置最长运行时间，使用电池时继续运行；Windows 休眠期间仍无法处理请求。
-- 工作进程或包装进程异常退出后，独立定时任务在下一次约一分钟的检查中恢复进程。主任务同时配置了 Windows 原生失败重试，但实际恢复不只依赖它。只有本次 Windows 启动中用户要求运行，才允许恢复；检查任务自身退出后，下一次定时触发仍可继续检查。
+- 后台进程异常退出后，独立定时任务在下一次约一分钟的检查中恢复进程。主任务同时配置了 Windows 原生失败重试，但实际恢复不只依赖它。只有本次 Windows 启动中用户要求运行，才允许恢复；检查任务自身退出后，下一次定时触发仍可继续检查。
 - 端口冲突、配置错误等确定性启动失败记录到日志和 status，并正常退出，不进行持续失败重试。
 - disable 后定时检查任务仍保留，以便恢复本次手动运行的进程；重新启动 Windows 后旧运行意图失效，没有登录启动任务就不会启动 MCP 进程。uninstall 会移除主任务及两个辅助任务。
 - `stop` 写入与本次 Windows 启动绑定的停止标记，阻止已排队的恢复重新提供服务。`start` 清除标记；重新启动 Windows 后旧标记失效，已 enable 的任务在用户登录时启动。同一次 Windows 启动内退出账户再登录仍保留主动停止状态。
 - 管理命令与后台进程分别使用用户及数据目录隔离的系统互斥锁；所有路径、任务名称和内核对象按用户隔离。
 - `_run --data-dir ...` 是计划任务内部入口，日常请使用 start。
 - PATH 只修改当前用户，去重并保留其他条目；uninstall 只移除本程序的确切目录。
-- 程序与配置目录仅当前用户、管理员和 SYSTEM 可访问，不再依赖 LocalService 或 ProgramData 权限。
+- 程序与配置目录仅当前用户、管理员和 SYSTEM 可访问。
 
-更新版本：
+### 更新与覆盖安装
+
+正常更新不需要先执行 `uninstall`。修改代码后，在普通 PowerShell 中按以下流程重新编译并覆盖安装，无需管理员权限。以下以仓库位于 `E:\Code\qbmcp` 为例，请按实际路径调整：
 
 ```powershell
+cd E:\Code\qbmcp
+
+# 编译新版，确认编译成功后再继续
+go build -trimpath -ldflags "-s -w" -o dist/qbmcp.exe .
+
+# 停止、覆盖安装、重新启动
 qbmcp stop
 .\install.ps1
 qbmcp start
+
+# 检查版本及运行状态
+qbmcp status
 ```
+
+覆盖安装会更新程序及已有任务的执行路径，保留端口、token 和登录启动设置，无需再次执行 `enable`。更新前应停止程序，以便替换后台 exe。如果已经取得编译好的新版 `dist\qbmcp.exe`，可以跳过编译步骤。
+
+`qbmcp uninstall` 用于移除安装：停止后台程序、删除本用户的三个计划任务，并移除用户 PATH 中的安装目录；程序文件、配置、token 和日志会保留。正常更新不需要卸载。
+
+发布仍只需要提供一份 `qbmcp.exe`；安装后两个 exe 应保存在同一安装目录，日常命令使用 `qbmcp.exe`。当前安装器从未签名构建生成 GUI 副本，不支持修改 Authenticode 签名文件；未来签名发布应分别构建、签名两个入口。
 
 更换端口：
 
@@ -131,7 +129,37 @@ qbmcp status --json
 - 日志每份 5 MiB、最多 3 个备份，保留 14 天并压缩。
 - 首版不包含 HTTPS/TLS 适配、远程访问、stdio 桥接和多网页路由。
 
-将以下内容合并到 Codex config.toml：
+### 直接在 Codex 的自定义 MCP 页面添加
+
+先运行 `qbmcp start`，再运行 `qbmcp status`，以输出中的 MCP 地址和配置路径为准。在 Codex 的插件/MCP 管理页面选择“添加自定义 MCP”（部分版本入口为设置 → MCP servers → Add server），按以下字段填写：
+
+| 页面字段 | 填写内容 |
+|---|---|
+| 名称 / Name | `qbmcp` |
+| 类型 / Transport | `Streamable HTTP` |
+| URL | `http://127.0.0.1:32300/mcp`，自定义端口时使用 status 显示的地址 |
+| HTTP 请求头 / Headers：名称 | `Authorization` |
+| HTTP 请求头 / Headers：值 | `Bearer <config.json 中的 token>`；Bearer 后有一个空格，去掉尖括号 |
+| Bearer token 环境变量 | 使用上面的请求头方式时留空 |
+
+这里的“Bearer token 环境变量”要求填**变量名称**，不能直接粘贴 token。通过请求头配置就无需设置环境变量。保存并启用 MCP 后，按页面提示重新加载/重启；如果仍显示旧工具列表，重新连接该 MCP。
+
+qbmcp 使用本地 token，不需要 OAuth 登录。连接成功且网页尚未连接时，只有 `qbmcp_discover_tools` 和 `qbmcp_call_tool` 两个内置工具。再打开 status 中的测试页面，输入同一 token 并连接，即可调用两个 demo 工具；在 Codex 中可以要求“调用 qbmcp 的 demo_set_text，把文字设为 Hello”。
+
+如果页面没有请求头输入框，可在 Codex 的 `config.toml` 中配置相同内容：
+
+```toml
+[mcp_servers.qbmcp]
+url = "http://127.0.0.1:32300/mcp"
+http_headers = { Authorization = "Bearer <替换为你的 token>" }
+tool_timeout_sec = 45
+```
+
+只选择一种认证方式。不要将实际 token 提交到仓库。[OpenAI Docs：MCP 的 HTTP、请求头及环境变量配置](https://learn.chatgpt.com/docs/extend/mcp?surface=app)
+
+### 使用环境变量配置（可选）
+
+将以下内容合并到 Codex config.toml，替代上述直接请求头配置：
 
 ```toml
 [mcp_servers.qbmcp]
@@ -282,7 +310,7 @@ $env:QBMCP_TOKEN = $qbConfig.token
 ```json
 {
   "service": "running",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "pid": 12345,
   "uptime_seconds": 120,
   "address": "127.0.0.1:32300",
@@ -298,6 +326,10 @@ $env:QBMCP_TOKEN = $qbConfig.token
 
 `status` 查询当前用户的计划任务、进程创建时间和健康接口，区分未安装、已停止、启动中、运行中、等待恢复及启动失败。PID 与创建时间共同校验，避免 PID 被复用时误认其他程序；健康接口的 PID 也必须匹配。
 
+文本及 `status --json` 都包含版本、PID、登录启动、任务及恢复检查状态、端口、监听地址、MCP/WebSocket/health/demo URL，以及命令程序、后台程序、安装目录、数据目录、配置文件、日志文件和运行记录的绝对路径。程序停止时仍显示配置端口和路径；没有配置时注明默认端口。`port_source` 为 `runtime`、`config`、`default` 或 `unavailable`，运行中优先显示实际监听端口。
+
+运行时另外显示运行版本、时长、网页连接、工具就绪、网页工具数、MCP 会话数和待处理请求数。健康接口不可达时明确显示“未查询到健康状态”，不误报为网页未连接。任务查询被拒绝时仍输出路径和配置详情，并以非零退出码报告错误。输出只表示 token 是否已配置，不包含 token 本身。
+
 ## 示例页面
 
 `web/demo.html` 是可直接修改的原生 HTML/JavaScript，编译后在 `/demo` 提供。
@@ -309,23 +341,23 @@ $env:QBMCP_TOKEN = $qbConfig.token
 
 ## 实施进度与验证记录
 
-本 README 继续作为后续 goal 模式的验收依据。v0.2 已将 Windows 系统服务替换为当前用户计划任务，MCP 和网页协议保持兼容。
+本 README 继续作为后续 goal 模式的验收依据。v0.2.1 仅保留当前用户计划任务实现，MCP 和网页协议保持兼容。
 
 - [x] Go 模块、配置、日志、单 exe 嵌入 HTML。
 - [x] 网页认证、动态 schema、单网页替换、FIFO 队列、取消和超时。
 - [x] MCP 两个稳定入口、动态工具、多客户端与变更通知。
 - [x] 用户目录安装、用户 PATH、任务管理、登录触发器和进程恢复实现。
-- [x] 旧 Windows 服务迁移脚本，保留原配置。
+- [x] 完整 status 输出、原生无控制台后台入口、清理系统服务检测与迁移代码。
 - [ ] 完成下列真实系统和客户端验收后，标记整体目标完成。
 
 2026-09-13，Windows amd64 / Go 1.24.3：
 
 - [x] Go 单元/集成测试：MCP、WebSocket、并发请求路由、schema、限流、取消、超大消息等原有测试通过。
 - [x] 用户路径和配置、PATH 去重/移除、互斥锁串行化、PID 创建时间及停止标记测试通过。
-- [x] 真实普通用户（非管理员）安装、PATH 去重、启停、登录开关、工作进程崩溃恢复、主动停止超过一分钟不重启、端口占用报错及卸载清理：通过（TestUserTaskLifecycle，136.76 秒）。原用户 PATH 恢复，独立测试任务已删除。
-- [x] 包装进程终止后没有遗留孤立工作进程，约一分钟后恢复：通过（TestUserWrapperRecovery，63.85 秒）。两项真实系统测试合计 201.235 秒。
-- [x] 最终 Windows 构建、go vet、Go 回归测试、4 项网页逻辑测试及三个 PowerShell 脚本语法检查：通过。
-- [ ] 真实旧服务迁移：需要一次管理员运行迁移脚本；本次开发未自动停用现有旧服务。
+- [x] v0.2.1 真实普通用户（非管理员）安装、PATH 去重、启停、登录开关、崩溃恢复、主动停止超过一分钟不重启、端口占用报错及卸载清理：通过（TestUserTaskLifecycle，136.95 秒）。原用户 PATH 恢复，独立测试任务已删除。
+- [x] GUI 副本 PE 头校验、实际任务直接执行后台 exe、后台 GetConsoleWindow 返回 0；运行和停止时的 status 均保留端口及路径，输出不含 token。
+- [x] v0.2.1 Go 全量单元及集成测试通过（含真实任务测试，共 138.668 秒），Windows 构建、go vet、两个 PowerShell 脚本语法检查通过。未修改网页代码，4 项网页逻辑测试沿用此前通过记录。
+- [x] 当前用户的已安装程序更新至 v0.2.1，主任务、恢复任务、登录任务全部改为直接执行后台 exe；运行于 32300，登录启动保持开启，配置文件内容完全保留。
 - [ ] 实际重新登录/重启 Windows，验证登录启动。
 - [ ] 真实浏览器和 Codex 会话操作两个演示工具。
 - [ ] CGO 竞态检查：此前环境无可用 GCC，需配置 Windows C 编译器后执行。
@@ -341,12 +373,12 @@ $env:CGO_ENABLED = '1'
 go test -race ./...
 ```
 
-可选的真实任务测试（普通用户运行，会创建独立临时任务和 PATH 条目并在结束时清理，耗时数分钟，不操作旧服务或默认实例）：
+可选的真实任务测试（普通用户运行，会创建独立临时任务和 PATH 条目并在结束时清理，耗时数分钟，不操作默认实例）：
 
 ```powershell
 go build -o dist/qbmcp.exe .
 $env:QBMCP_LIFECYCLE_TEST = '1'
-go test -run '^TestUser(TaskLifecycle|WrapperRecovery)$' -v -count=1 -timeout=7m
+go test -run '^TestUserTaskLifecycle$' -v -count=1 -timeout=7m
 Remove-Item Env:QBMCP_LIFECYCLE_TEST
 ```
 
@@ -365,8 +397,8 @@ Remove-Item Env:QBMCP_LIFECYCLE_TEST
 
 | 现象 | 检查 |
 |---|---|
-| 提示旧 Windows 服务存在 | 先按迁移步骤运行一次管理员脚本，再回到普通终端安装 |
 | 找不到 qbmcp 命令 | 运行 install，并重新打开终端；其他应用可能也需重启以刷新 PATH |
+| 每分钟闪一下命令行窗口 | 旧任务直接启动 PowerShell，WindowStyle Hidden 来不及阻止初始控制台出现。执行 stop → 新版 install → start 更新任务；新版直接执行 GUI 子系统的后台 exe，任务管理子进程使用 CREATE_NO_WINDOW。参见 [Windows 进程创建标志](https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags) |
 | 计划任务操作被拒绝 | 检查系统任务计划程序服务及组织策略；不要改用管理员长期运行来掩盖权限问题 |
 | 状态 recovering | 异常退出后的恢复等待期；约一分钟后检查，持续失败则查看日志 |
 | 状态 failed | 查看 status 错误和用户目录日志，修复配置/端口问题后 start |
@@ -374,3 +406,14 @@ Remove-Item Env:QBMCP_LIFECYCLE_TEST
 | WebSocket 403 | 通过 /demo 访问，检查 Origin，不要直接双击 HTML 使用 file:// |
 | 新动态工具不可见 | 先 discover，再用 qbmcp_call_tool；必要时重新连接 MCP |
 | 工具超时 | 保持页面活跃，检查网页/API 日志；操作可能已经发生，不要盲目重试 |
+
+## 连接
+
+| 字段 | 内容 |
+|---|---|
+| 名称 | `qbmcp` |
+| 类型 | `Streamable HTTP` |
+| URL | `http://127.0.0.1:32300/mcp` |
+| HTTP 请求头名称 | `Authorization` |
+| HTTP 请求头值 | `Bearer 你的token` |
+| Bearer token 环境变量 | 留空 |
